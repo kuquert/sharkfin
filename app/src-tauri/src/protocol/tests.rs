@@ -579,3 +579,21 @@ fn the_clock_sits_past_the_checksum() {
     assert_eq!(&pkt[8..15], &[0x07, 0xD1, 2, 3, 4, 5, 6]);
     assert!(pkt[15..].iter().all(|&b| b == 0));
 }
+
+/// The magnetic yc500 packs a profile and sub-layer into one scaled slot;
+/// everyone else uses the profile as-is. The export and restore paths move
+/// profiles through these two and must land back where they started.
+#[test]
+fn yc500_profile_slot_round_trips() {
+    for profile in 0..4u8 {
+        for sublayer in 0..4u8 {
+            let slot = yc500_profile_slot(true, profile, sublayer);
+            assert_eq!(slot, profile * 4 + sublayer);
+            assert_eq!(yc500_profile_from_slot(true, slot), profile);
+        }
+    }
+    for profile in 0..8u8 {
+        assert_eq!(yc500_profile_slot(false, profile, 0), profile);
+        assert_eq!(yc500_profile_from_slot(false, profile), profile);
+    }
+}

@@ -503,7 +503,7 @@ export default function DevicePage({
       <Section title={t("Backup")}>
         <div className="flex items-center justify-between gap-4">
           <p className="text-sm text-muted-foreground">
-            {t("Keymaps for every profile and layer, lighting and settings, as one file. Per-key paint patterns live in the Paint tab, because the firmware can't report those back.")}
+            {t("Keymaps for every profile and layer, lighting, settings and, on magnetic boards, the switch settings, as one file. Per-key paint patterns live in the Paint tab, because the firmware can't report those back.")}
           </p>
           <div className="flex shrink-0 gap-2">
             <Button size="sm" variant="ghost" disabled={transferring} onClick={doExport}>

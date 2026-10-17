@@ -81,7 +81,7 @@ extern "C" {
 // ---------------------------------------------------------------------------
 // Transport: WebHID feature reports with the same pacing as hid.rs
 use ops::{check_macro_slot, key_write_packet, need, read_matrix};
-use session::{switch_access, OwnerRecord, SavedConfig, SwitchAccess};
+use session::{check_saved_version, switch_access, OwnerRecord, SavedConfig, SwitchAccess};
 use wire::{LinkKind as Link, Wire, WireError as HidErr, WireError};
 
 fn js_err_text(e: JsValue) -> String {
@@ -1502,6 +1502,8 @@ pub async fn export_config() -> Result<JsValue, JsValue> {
         _ => None,
     };
     let cfg = SavedConfig {
+        // The browser build still captures the version 1 set; the desktop
+        // build adds sub-layers and switch settings.
         version: 1,
         device_id: spec.id,
         family: spec.family.clone(),
@@ -1517,6 +1519,8 @@ pub async fn export_config() -> Result<JsValue, JsValue> {
             (Some(o), Some((_, get))) => KbOptions::from_reply_expecting(&o, get),
             _ => None,
         },
+        sub_layers: None,
+        switch_settings: None,
     };
     serde_json::to_string_pretty(&cfg)
         .map(JsValue::from)
@@ -1529,6 +1533,16 @@ pub async fn export_config() -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub async fn import_config(raw: String) -> Result<JsValue, JsValue> {
     let cfg: SavedConfig = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+    check_saved_version(cfg.version)?;
+    // Restoring sub-layers and switch settings moves the active profile,
+    // which the browser build never does. Refuse the file rather than
+    // silently skipping that data.
+    if cfg.sub_layers.is_some() || cfg.switch_settings.is_some() {
+        return Err(
+            "this backup holds mod-tap and switch settings, which the browser build cannot restore. Use the desktop app for this file."
+                .into(),
+        );
+    }
     let _busy = acquire().await;
     let (t, spec) = get_open(true)?;
     if cfg.device_id != spec.id {

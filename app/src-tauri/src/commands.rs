@@ -586,28 +586,39 @@ pub fn get_screen_version(state: tauri::State<AppState>) -> Result<Option<u16>, 
     })
 }
 
+/// Switch the active profile and confirm it landed. Shared by the command,
+/// which paces before calling, and the backup paths, which switch per
+/// profile and restore the one that was active. The switch lands in flash
+/// and gets no ack, and anything on the wire during the commit can stall
+/// the endpoint. GET_PROFILE is no probe of the commit either: it answers
+/// within 25 ms while the commit is still going. So the full quiet comes
+/// first and the confirmation after, with the caller's device lock held
+/// throughout, like a flash batch.
+fn switch_active_profile(
+    t: &Transport,
+    fc: &'static FamilyCmds,
+    scaled: bool,
+    profile: u8,
+) -> Result<(), HidError> {
+    let slot = crate::protocol::yc500_profile_slot(scaled, profile, 0);
+    let pkt = crate::protocol::packet(fc.set_profile, &[slot], Checksum::Bit7);
+    t.send(&pkt)?;
+    std::thread::sleep(SETTING_GAP);
+    let reply = t.roundtrip(fc.get_profile, &[], Checksum::Bit7)?;
+    if reply[1] != slot {
+        return Err(HidError::Protocol(
+            "the board did not take the profile switch".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[tauri::command(async)]
 pub fn set_profile(state: tauri::State<AppState>, profile: u8) -> Result<(), String> {
     write_gap(&state, SETTING_GAP);
-    let profile = crate::protocol::yc500_profile_slot(scaled_profiles(&state), profile, 0);
+    let scaled = scaled_profiles(&state);
     with_writable(&state, |t, fc| {
-        let fc = need(fc)?;
-        let pkt = crate::protocol::packet(fc.set_profile, &[profile], Checksum::Bit7);
-        t.send(&pkt)?;
-        // The switch lands in flash and gets no ack, and anything on the
-        // wire during the commit can stall the endpoint. GET_PROFILE is no
-        // probe of the commit either: it answers within 25 ms while the
-        // commit is still going. So the full quiet comes first and the
-        // confirmation after, with the device lock held throughout, like a
-        // flash batch.
-        std::thread::sleep(SETTING_GAP);
-        let reply = t.roundtrip(fc.get_profile, &[], Checksum::Bit7)?;
-        if reply[1] != profile {
-            return Err(HidError::Protocol(
-                "the board did not take the profile switch".into(),
-            ));
-        }
-        Ok(())
+        switch_active_profile(t, need(fc)?, scaled, profile)
     })
 }
 
@@ -1150,41 +1161,51 @@ fn switch_type_listed(state: &tauri::State<AppState>, code: Option<u8>) -> bool 
     })
 }
 
+/// Every readable column for the profile that is active on the wire, plus
+/// the four dynamic-keystroke action blocks. The hall block always belongs
+/// to the active profile, so per-profile capture moves it first.
+fn read_hall_columns(
+    t: &Transport,
+    f: hall::Columns,
+    with_type: bool,
+) -> Result<hall::SwitchSettings, HidError> {
+    let cols = hall::read_columns(with_type);
+    let column = |subop: u8| -> Result<Vec<u8>, HidError> {
+        let mut out = Vec::with_capacity(256);
+        for page in 0..f.get_pages(subop) {
+            out.extend_from_slice(&t.read_raw_page(
+                hall::GET,
+                &f.get_payload(subop, page),
+                Checksum::Bit7,
+            )?);
+        }
+        Ok(out)
+    };
+    let mut columns = Vec::new();
+    for &subop in cols.iter() {
+        columns.push((subop, f.decode(subop, &column(subop)?)));
+    }
+    // Sub-op 10: four blocks of one byte a slot, two pages a block.
+    let mut dks_all = Vec::with_capacity(4 * f.slots());
+    for block in 0..4u8 {
+        let mut raw = Vec::with_capacity(128);
+        for page in [2 * block, 2 * block + 1] {
+            raw.extend_from_slice(&t.read_raw_page(
+                hall::GET,
+                &f.get_payload(hall::DKS_ACTIONS_ALL, page),
+                Checksum::Bit7,
+            )?);
+        }
+        dks_all.extend_from_slice(&raw[..f.slots()]);
+    }
+    Ok(hall::assemble(f, &columns, &dks_all))
+}
+
 #[tauri::command(async)]
 pub fn get_switches(state: tauri::State<AppState>) -> Result<hall::SwitchSettings, String> {
     let f = hall_format(&state)?;
-    let cols = hall::read_columns(switch_type_listed(&state, None));
-    with_open(&state, |t, _| {
-        let column = |subop: u8| -> Result<Vec<u8>, HidError> {
-            let mut out = Vec::with_capacity(256);
-            for page in 0..f.get_pages(subop) {
-                out.extend_from_slice(&t.read_raw_page(
-                    hall::GET,
-                    &f.get_payload(subop, page),
-                    Checksum::Bit7,
-                )?);
-            }
-            Ok(out)
-        };
-        let mut columns = Vec::new();
-        for &subop in cols.iter() {
-            columns.push((subop, f.decode(subop, &column(subop)?)));
-        }
-        // Sub-op 10: four blocks of one byte a slot, two pages a block.
-        let mut dks_all = Vec::with_capacity(4 * f.slots());
-        for block in 0..4u8 {
-            let mut raw = Vec::with_capacity(128);
-            for page in [2 * block, 2 * block + 1] {
-                raw.extend_from_slice(&t.read_raw_page(
-                    hall::GET,
-                    &f.get_payload(hall::DKS_ACTIONS_ALL, page),
-                    Checksum::Bit7,
-                )?);
-            }
-            dks_all.extend_from_slice(&raw[..f.slots()]);
-        }
-        Ok(hall::assemble(f, &columns, &dks_all))
-    })
+    let with_type = switch_type_listed(&state, None);
+    with_open(&state, |t, _| read_hall_columns(t, f, with_type))
 }
 
 /// Live travel on a magnetic gen2 board, by cable. `0x1B 01` starts the
@@ -1486,16 +1507,23 @@ pub fn write_macro(state: tauri::State<AppState>, slot: u8, data: Macro) -> Resu
 
 #[tauri::command(async)]
 pub fn export_config(state: tauri::State<AppState>, path: String) -> Result<String, String> {
-    let spec = {
+    let (spec, revision, owner_switch_writes, unregistered_ok) = {
         let inner = state.inner.lock();
-        inner
-            .open
-            .as_ref()
-            .map(|o| o.spec.clone())
-            .ok_or("no device connected")?
+        let open = inner.open.as_ref().ok_or("no device connected")?;
+        (
+            open.spec.clone(),
+            open.revision,
+            inner.owner.switch_writes,
+            inner.unregistered_ok,
+        )
     };
     let scaled = ops::scaled_profiles(&spec);
     let wire = led_wire(&state);
+    // A backup is a read; the switch capture is the one place it writes.
+    // The read-only rule is the same one `connected` answers the UI with.
+    let read_only = !spec.writes_supported() || (spec.unregistered && !unregistered_ok);
+    let (read_sub_layers, capture_switches) =
+        crate::session::capture_gates(&spec, revision, read_only, owner_switch_writes);
     let cfg = with_open(&state, |t, fc| {
         let fc = need(fc)?;
         let n = spec.profiles.clamp(1, MAX_PROFILES);
@@ -1510,6 +1538,52 @@ pub fn export_config(state: tauri::State<AppState>, path: String) -> Result<Stri
                 false,
             ))?);
             fn_layers.push(block_on(ops::read_matrix(t, fc, p, 0, true))?);
+        }
+        // Sub-layers 1..3 (dynamic keystroke, mod-tap, toggle) are read
+        // straight off each profile; the 0x8A payload names profile and
+        // sub-layer separately, so the active profile never moves.
+        let mut sub_layers = None;
+        if read_sub_layers {
+            let mut out = Vec::new();
+            for p in 0..n {
+                let mut layers = Vec::new();
+                for s in 1..4u8 {
+                    layers.push(block_on(ops::read_matrix(
+                        t,
+                        fc,
+                        crate::protocol::yc500_profile_slot(scaled, p, s),
+                        s,
+                        false,
+                    ))?);
+                }
+                out.push(layers);
+            }
+            sub_layers = Some(out);
+        }
+        // The hall block belongs to the active profile, so per-profile
+        // capture switches it. That is a write: read-only links, and boards
+        // whose switch write is not allowed, leave the field out. Whatever
+        // happens in the loop, the board ends on the profile it started
+        // on: the active profile is user state, and a failed backup must
+        // not move it.
+        let mut switch_settings = None;
+        if capture_switches {
+            let f = ops::hall_format(&spec, revision).map_err(HidError::Protocol)?;
+            let with_type = !spec.switch_types.is_empty();
+            let active = t.roundtrip(fc.get_profile, &[], Checksum::Bit7)?[1];
+            let active = crate::protocol::yc500_profile_from_slot(scaled, active);
+            let mut out = Vec::new();
+            let captured = (|| -> Result<(), HidError> {
+                for p in 0..n {
+                    switch_active_profile(t, fc, scaled, p)?;
+                    out.push(read_hall_columns(t, f, with_type)?);
+                }
+                Ok(())
+            })();
+            let restored = switch_active_profile(t, fc, scaled, active);
+            captured?;
+            restored?;
+            switch_settings = Some(out);
         }
         let led = block_on(ops::read_led_param(t, wire))?;
         let deb = t.roundtrip(fc.get_debounce, &[], Checksum::Bit7)?;
@@ -1526,7 +1600,7 @@ pub fn export_config(state: tauri::State<AppState>, path: String) -> Result<Stri
             _ => None,
         };
         Ok(SavedConfig {
-            version: 1,
+            version: crate::session::SAVED_CONFIG_VERSION,
             device_id: spec.id,
             family: spec.family.clone(),
             board: spec.label(),
@@ -1541,11 +1615,20 @@ pub fn export_config(state: tauri::State<AppState>, path: String) -> Result<Stri
                 (Some(o), Some((_, get))) => KbOptions::from_reply_expecting(&o, get),
                 _ => None,
             },
+            sub_layers,
+            switch_settings,
         })
     })?;
     let json = serde_json::to_string_pretty(&cfg).map_err(err_str)?;
     std::fs::write(&path, json).map_err(err_str)?;
-    Ok(format!("saved {} profiles to {path}", cfg.profiles.len()))
+    Ok(if cfg.switch_settings.is_some() {
+        format!(
+            "saved {} profiles with their switch settings to {path}",
+            cfg.profiles.len()
+        )
+    } else {
+        format!("saved {} profiles to {path}", cfg.profiles.len())
+    })
 }
 
 /// Applies a saved config: only slots that differ are written, then the
@@ -1555,13 +1638,16 @@ pub fn export_config(state: tauri::State<AppState>, path: String) -> Result<Stri
 pub fn import_config(state: tauri::State<AppState>, path: String) -> Result<String, String> {
     let raw = std::fs::read_to_string(&path).map_err(err_str)?;
     let cfg: SavedConfig = serde_json::from_str(&raw).map_err(err_str)?;
-    let spec = {
+    crate::session::check_saved_version(cfg.version)?;
+    let (spec, revision, owner_switch_writes, switch_trial) = {
         let inner = state.inner.lock();
-        inner
-            .open
-            .as_ref()
-            .map(|o| o.spec.clone())
-            .ok_or("no device connected")?
+        let open = inner.open.as_ref().ok_or("no device connected")?;
+        (
+            open.spec.clone(),
+            open.revision,
+            inner.owner.switch_writes,
+            inner.switch_trial,
+        )
     };
     let wire = led_wire(&state);
     if cfg.device_id != spec.id {
@@ -1573,6 +1659,38 @@ pub fn import_config(state: tauri::State<AppState>, path: String) -> Result<Stri
             spec.id
         ));
     }
+    let n = spec.profiles.clamp(1, MAX_PROFILES);
+    // Data the connected board cannot take is an error, not a skip:
+    // silently dropping it is what a restore is supposed to fix.
+    let hall_access = switch_access(&spec, revision, false, owner_switch_writes);
+    if cfg.sub_layers.is_some()
+        && !(spec.family == "gen2"
+            && matches!(hall_access, SwitchAccess::Write | SwitchAccess::Global))
+    {
+        return Err(format!(
+            "this backup holds mod-tap, toggle and snap bindings, but {} cannot take them",
+            spec.label()
+        ));
+    }
+    if cfg.switch_settings.is_some()
+        && !crate::session::hall_write_allowed(
+            &spec,
+            revision,
+            owner_switch_writes,
+            switch_trial,
+            None,
+        )
+    {
+        return Err(crate::session::hall_write_refusal(&spec));
+    }
+    // Every shape check happens before the first write, so a malformed
+    // file leaves the board untouched.
+    let slots = if cfg.switch_settings.is_some() {
+        Some(ops::hall_format(&spec, revision).map_err(err_str)?.slots())
+    } else {
+        None
+    };
+    cfg.check_v2_shapes(n, slots)?;
     let scaled = ops::scaled_profiles(&spec);
     if spec.bulk_keymap {
         flash_cooldown(&state);
@@ -1648,6 +1766,146 @@ pub fn import_config(state: tauri::State<AppState>, path: String) -> Result<Stri
                 layers_uploaded += 1;
             }
         }
+        // Sub-layers 1..3, same checked-first-write and bulk fallback as
+        // the base layers above, sharing their checked/bulk state. Shapes
+        // were checked before any write.
+        if let Some(sub_layers) = &cfg.sub_layers {
+            for (p, layers) in sub_layers.iter().enumerate() {
+                for (s, target) in layers.iter().enumerate() {
+                    let sublayer = s as u8 + 1;
+                    let wire = crate::protocol::yc500_profile_slot(scaled, p as u8, sublayer);
+                    let current = block_on(ops::read_matrix(t, fc, wire, sublayer, false))?;
+                    let differ: Vec<usize> = (0..128usize)
+                        .filter(|s| current[s * 4..s * 4 + 4] != target[s * 4..s * 4 + 4])
+                        .collect();
+                    if differ.is_empty() {
+                        continue;
+                    }
+                    let whole: [u8; 512] = target.as_slice().try_into().unwrap();
+                    if !bulk {
+                        let mut i = 0;
+                        while i < differ.len() {
+                            let slot = differ[i];
+                            let want: [u8; 4] = whole[slot * 4..slot * 4 + 4].try_into().unwrap();
+                            if checked {
+                                t.send(&key_write_packet(
+                                    fc, wire, sublayer, slot as u8, want, false,
+                                )?)?;
+                            } else {
+                                checked = true;
+                                let landed = block_on(ops::write_slot_checked(
+                                    t, fc, wire, sublayer, slot as u8, want, false,
+                                ))?;
+                                if !landed {
+                                    if !ops::bulk_fallback_allowed(&spec, sublayer, slot as u8) {
+                                        return Err(HidError::Protocol(format!(
+                                            "{} did not take the key write",
+                                            spec.label()
+                                        )));
+                                    }
+                                    bulk = true;
+                                    std::thread::sleep(FLASH_COOLDOWN);
+                                    break;
+                                }
+                            }
+                            keys_written += 1;
+                            std::thread::sleep(KEY_GAP);
+                            i += 1;
+                        }
+                        if !bulk {
+                            continue;
+                        }
+                    }
+                    if layers_uploaded > 0 {
+                        std::thread::sleep(FLASH_COOLDOWN);
+                    }
+                    block_on(ops::write_layer_bulk(
+                        t, fc, wire, &whole, false, FLASH_PACE,
+                    ))?;
+                    keys_written += differ.len();
+                    layers_uploaded += 1;
+                }
+            }
+        }
+        // The hall block belongs to the active profile, so a restore moves
+        // it per profile. Shapes were checked before any write; whatever
+        // happens in the loop, the board ends on the profile it started
+        // on.
+        if let Some(settings) = &cfg.switch_settings {
+            let f = ops::hall_format(&spec, revision).map_err(HidError::Protocol)?;
+            let with_type = !spec.switch_types.is_empty();
+            // The profile switch is a settings write; give the key writes
+            // above the same floor the command uses.
+            std::thread::sleep(SETTING_GAP);
+            let active = t.roundtrip(fc.get_profile, &[], Checksum::Bit7)?[1];
+            let active = crate::protocol::yc500_profile_from_slot(scaled, active);
+            let mut hall_cooled = false;
+            let written = (|| -> Result<(), HidError> {
+                for (p, target) in settings.iter().enumerate() {
+                    switch_active_profile(t, fc, scaled, p as u8)?;
+                    let live = read_hall_columns(t, f, with_type)?;
+                    // The vendor's column order, mode first; a column is
+                    // written only where a key differs, and slots that match
+                    // live go back as live.
+                    let mut cols = hall::WRITE_COLUMNS.to_vec();
+                    cols.extend([hall::DKS_START, hall::MT_TIME, hall::SNAP_PARTNER]);
+                    if with_type {
+                        cols.push(hall::SWITCH_TYPE);
+                    }
+                    let mut plan: Vec<(u8, Vec<u16>)> = Vec::new();
+                    for &subop in &cols {
+                        let mut values = Vec::with_capacity(f.slots());
+                        let mut any = false;
+                        for s in 0..f.slots() {
+                            let have = live.keys[s].wire(f, subop);
+                            let want = target.keys[s].wire(f, subop);
+                            any |= have != want;
+                            values.push(want);
+                        }
+                        if any {
+                            plan.push((subop, values));
+                        }
+                    }
+                    let dks_slots: Vec<u8> = (0..f.slots())
+                        .filter(|&s| target.keys[s].dks_actions != live.keys[s].dks_actions)
+                        .map(|s| s as u8)
+                        .collect();
+                    if plan.is_empty() && dks_slots.is_empty() {
+                        continue;
+                    }
+                    if !hall_cooled {
+                        std::thread::sleep(FLASH_COOLDOWN);
+                        hall_cooled = true;
+                    }
+                    let ncols = plan.len();
+                    for (i, (subop, values)) in plan.iter().enumerate() {
+                        let last = i + 1 == ncols && dks_slots.is_empty();
+                        for pkt in f.set_all(*subop, values, last) {
+                            t.send(&pkt)?;
+                            std::thread::sleep(FLASH_PAGE_GAP);
+                        }
+                    }
+                    let nslots = dks_slots.len();
+                    for (i, &slot) in dks_slots.iter().enumerate() {
+                        let pkt = f
+                            .set_dks_actions(
+                                slot,
+                                i + 1 == nslots,
+                                target.keys[usize::from(slot)].dks_actions,
+                            )
+                            .ok_or_else(|| HidError::Protocol("slot out of range".into()))?;
+                        t.send(&pkt)?;
+                        std::thread::sleep(FLASH_PAGE_GAP);
+                    }
+                    // The next profile switch must not land on a commit.
+                    std::thread::sleep(FLASH_SETTLE);
+                }
+                Ok(())
+            })();
+            let restored = switch_active_profile(t, fc, scaled, active);
+            written?;
+            restored?;
+        }
         if let (Some(opts), Some((set, get))) = (cfg.options, fc.kboption) {
             let cur = t.roundtrip(get, &[0], Checksum::Bit7)?;
             t.send(&opts.to_packet_as(set, cur[2], cur[3], cur[4]))?;
@@ -1675,10 +1933,17 @@ pub fn import_config(state: tauri::State<AppState>, path: String) -> Result<Stri
             std::thread::sleep(KEY_GAP);
         }
         t.send(&cfg.led.to_packet_for(wire))?;
-        Ok(format!(
-            "restored {keys_written} keys, settings and lighting from {}",
-            cfg.board
-        ))
+        Ok(if cfg.switch_settings.is_some() {
+            format!(
+                "restored {keys_written} keys, lighting, settings and switch settings from {}",
+                cfg.board
+            )
+        } else {
+            format!(
+                "restored {keys_written} keys, settings and lighting from {}",
+                cfg.board
+            )
+        })
     });
     if bulk && !spec.bulk_keymap {
         let mut inner = state.inner.lock();
